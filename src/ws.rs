@@ -1,38 +1,67 @@
-use futures_util::{SinkExt, StreamExt};
+use std::{
+    collections::HashMap,
+    env,
+    io::Error as IoError,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
+
+use futures_channel::mpsc::{unbounded, UnboundedSender};
+use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
 use log::*;
-use std::net::SocketAddr;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::{accept_async, tungstenite::Error};
-use tungstenite::Result;
+use tungstenite::protocol::Message;
 
-async fn accept_connection(peer: SocketAddr, stream: TcpStream) {
-    if let Err(e) = handle_connection(peer, stream).await {
-        match e {
-            Error::ConnectionClosed | Error::Protocol(_) | Error::Utf8 => (),
-            err => error!("Error processing connection: {}", err),
+type Tx = UnboundedSender<Message>;
+type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
+
+pub async fn handle_connection(peer_map: PeerMap, raw_stream: TcpStream, addr: SocketAddr) {
+    info!("Incoming TCP connection from: {}", addr);
+
+    let ws_stream = tokio_tungstenite::accept_async(raw_stream)
+        .await
+        .expect("Error during the websocket handshake occurred");
+    info!("WebSocket connection established: {}", addr);
+
+    // Insert the write part of this peer to the peer map.
+    let (tx, rx) = unbounded();
+    peer_map.lock().unwrap().insert(addr, tx);
+
+    let (outgoing, incoming) = ws_stream.split();
+
+    let broadcast_incoming = incoming.try_for_each(|msg| {
+        info!("Received a message from {}: {}", addr, msg.to_text().unwrap());
+        let peers = peer_map.lock().unwrap();
+
+        // We want to broadcast the message to everyone except ourselves.
+        // let broadcast_recipients =
+        //     peers.iter().filter(|(peer_addr, _)| peer_addr != &&addr).map(|(_, ws_sink)| ws_sink);
+        let broadcast_recipients =
+            peers.iter().map(|(_, ws_sink)| ws_sink);
+
+
+        for recp in broadcast_recipients {
+            info!("sending message");
+            recp.unbounded_send(msg.clone()).unwrap();
         }
-    }
-}
 
-async fn handle_connection(peer: SocketAddr, stream: TcpStream) -> Result<()> {
-    let mut ws_stream = accept_async(stream).await.expect("Failed to accept");
+        future::ok(())
+    });
 
-    info!("New WebSocket connection: {}", peer);
+    let receive_from_others = rx.map(Ok).forward(outgoing);
 
-    while let Some(msg) = ws_stream.next().await {
-        let msg = msg?;
-        if msg.is_text() || msg.is_binary() {
-            ws_stream.send(msg).await?;
-        }
-    }
+    pin_mut!(broadcast_incoming, receive_from_others);
+    future::select(broadcast_incoming, receive_from_others).await;
 
-    Ok(())
+    info!("{} disconnected", &addr);
+    peer_map.lock().unwrap().remove(&addr);
 }
 
 #[cfg(test)]
 mod tests {
-    use tokio::net::TcpListener;
     use log::*;
+    use tokio::net::TcpListener;
+
     use crate::ws::accept_connection;
 
     #[test]
