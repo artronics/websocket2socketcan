@@ -12,10 +12,13 @@ use log::*;
 use tokio::net::{TcpListener, TcpStream};
 use tungstenite::protocol::Message;
 
-type Tx = UnboundedSender<Message>;
-type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
+use super::can::{Can, CanFrame};
 
-pub async fn handle_connection(peer_map: PeerMap, raw_stream: TcpStream, addr: SocketAddr) {
+type Tx = UnboundedSender<Message>;
+pub type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
+type CanFrameHandler = fn(&Can, CanFrame);
+
+pub async fn handle_connection(peer_map: PeerMap, raw_stream: TcpStream, addr: SocketAddr, can: &Can) {
     info!("Incoming TCP connection from: {}", addr);
 
     let ws_stream = tokio_tungstenite::accept_async(raw_stream)
@@ -32,6 +35,8 @@ pub async fn handle_connection(peer_map: PeerMap, raw_stream: TcpStream, addr: S
     let broadcast_incoming = incoming.try_for_each(|msg| {
         info!("Received a message from {}: {}", addr, msg.to_text().unwrap());
         let peers = peer_map.lock().unwrap();
+        let f = CanFrame::new(0x123, [1; 8], 8, false, false);
+        can.write(f);
 
         // We want to broadcast the message to everyone except ourselves.
         // let broadcast_recipients =
